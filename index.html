@@ -384,14 +384,58 @@ function cardSt(id){
 }
 
 // ── Server polling ────────────────────────────────────────────────────────────
+async function fetchPricesDirect(){
+  // Fetch prices directly from browser - bypasses any server network restrictions
+  const apis = [
+    async () => {
+      const r = await fetch('https://www.freeforexapi.com/api/live?pairs=EURUSD,USDCHF,USDJPY,AUDUSD',{signal:AbortSignal.timeout(8000)});
+      const d = await r.json();
+      if(d.code!==200||!d.rates) throw new Error('bad');
+      const p={};
+      Object.entries(d.rates).forEach(([k,v])=>{p[k.toLowerCase()]=v.rate;});
+      return p;
+    },
+    async () => {
+      const r = await fetch('https://open.er-api.com/v6/latest/USD',{signal:AbortSignal.timeout(8000)});
+      const d = await r.json();
+      if(d.result!=='success'||!d.rates) throw new Error('bad');
+      const r2=d.rates;
+      return {usdchf:r2.CHF,usdjpy:r2.JPY,eurusd:r2.EUR?1/r2.EUR:null,audusd:r2.AUD?1/r2.AUD:null};
+    },
+    async () => {
+      const r = await fetch('https://api.frankfurter.dev/v2/latest?base=USD&symbols=CHF,JPY,EUR,AUD',{signal:AbortSignal.timeout(8000)});
+      const d = await r.json();
+      if(!d.rates) throw new Error('bad');
+      const r2=d.rates;
+      return {usdchf:r2.CHF,usdjpy:r2.JPY,eurusd:r2.EUR?1/r2.EUR:null,audusd:r2.AUD?1/r2.AUD:null};
+    }
+  ];
+  for(const api of apis){
+    try{
+      const p = await api();
+      const valid = Object.values(p).filter(v=>v&&!isNaN(v)).length;
+      if(valid>=3){
+        prevPx={...livePx};
+        Object.entries(p).forEach(([k,v])=>{if(v&&!isNaN(v))livePx[k]=v;});
+        updatePriceChips();
+        // Send prices to server for manipulation detection
+        fetch(SERVER+'/price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(livePx),signal:AbortSignal.timeout(3000)}).catch(()=>{});
+        return;
+      }
+    }catch(e){console.log('Price API failed:',e.message);}
+  }
+  console.log('All price APIs failed from browser');
+}
+
 async function pollServer(){
   try{
     const r = await fetch(SERVER+'/state',{signal:AbortSignal.timeout(5000)});
     if(!r.ok) throw new Error('Bad response');
     const data = await r.json();
 
-    // Update prices from server state
-    if(data.prices && Object.keys(data.prices).length > 0){
+    // Prices come from browser direct fetch not server
+    // but use server prices as fallback if we have them
+    if(data.prices && Object.keys(data.prices).length > 0 && Object.keys(livePx).length === 0){
       prevPx = {...livePx};
       Object.entries(data.prices).forEach(([k,v])=>{ if(v&&!isNaN(v)) livePx[k]=v; });
       updatePriceChips();
@@ -784,7 +828,11 @@ render();
 renderLog();
 updateSummary();
 
-// Poll server every 5 seconds
+// Fetch prices directly from browser every 15 seconds
+fetchPricesDirect();
+setInterval(fetchPricesDirect, 15000);
+
+// Poll server for state/alerts every 5 seconds
 pollServer();
 setInterval(pollServer, 5000);
 
