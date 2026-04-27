@@ -162,6 +162,21 @@ async function fetchPrices() {
   const now = Date.now();
   if (now - priceLastFetch < 10000 && Object.keys(cachedPrices).length >= 3) return cachedPrices;
   const apis = [
+    // API 1: Frankfurter - ECB data, completely free, no key, very reliable
+    async () => {
+      const d = await httpsGet('api.frankfurter.dev', '/v2/latest?base=USD&symbols=CHF,JPY,EUR,AUD');
+      if (!d.rates) throw new Error('bad');
+      const r = d.rates;
+      return { usdchf:r.CHF, usdjpy:r.JPY, eurusd:r.EUR?1/r.EUR:null, audusd:r.AUD?1/r.AUD:null };
+    },
+    // API 2: open.er-api.com - free, no key required
+    async () => {
+      const d = await httpsGet('open.er-api.com', '/v6/latest/USD');
+      if (d.result !== 'success' || !d.rates) throw new Error('bad');
+      const r = d.rates;
+      return { usdchf:r.CHF, usdjpy:r.JPY, eurusd:r.EUR?1/r.EUR:null, audusd:r.AUD?1/r.AUD:null };
+    },
+    // API 3: freeforexapi - supports all 4 pairs directly
     async () => {
       const d = await httpsGet('www.freeforexapi.com', '/api/live?pairs=EURUSD,USDCHF,USDJPY,AUDUSD');
       if (d.code !== 200 || !d.rates) throw new Error('bad');
@@ -169,37 +184,35 @@ async function fetchPrices() {
       Object.entries(d.rates).forEach(([k,v]) => { p[k.toLowerCase()] = v.rate; });
       return p;
     },
+    // API 4: currency-exchang on Railway - no CORS issues, same platform
     async () => {
-      const d = await httpsGet('open.er-api.com', '/v6/latest/USD');
-      if (d.result !== 'success' || !d.rates) throw new Error('bad');
-      const r = d.rates;
-      return { usdchf:r.CHF, usdjpy:r.JPY, eurusd:r.EUR?1/r.EUR:null, audusd:r.AUD?1/r.AUD:null };
-    },
-    async () => {
-      const d = await httpsGet('api.frankfurter.dev', '/v2/latest?base=USD&symbols=CHF,JPY,EUR,AUD');
+      const d = await httpsGet('currency-exchang.up.railway.app', '/rates?base=USD');
       if (!d.rates) throw new Error('bad');
       const r = d.rates;
       return { usdchf:r.CHF, usdjpy:r.JPY, eurusd:r.EUR?1/r.EUR:null, audusd:r.AUD?1/r.AUD:null };
     }
   ];
-  for (const api of apis) {
+  for (let idx = 0; idx < apis.length; idx++) {
     try {
-      const p = await api();
+      console.log('Trying price API ' + (idx+1) + '...');
+      const p = await apis[idx]();
       const valid = Object.values(p).filter(v => v && !isNaN(v)).length;
       if (valid >= 3) {
         Object.entries(p).forEach(([k,v]) => { if (v && !isNaN(v)) cachedPrices[k] = v; });
         priceLastFetch = Date.now();
+        lastUpdated = Date.now();
         PAIRS.forEach(id => {
           const price = parseFloat(cachedPrices[id]);
           if (!isNaN(price) && STATE[id]) {
-            STATE[id].levels.forEach((_,i) => checkAutoManip(id, price, i));
+            STATE[id].levels.forEach((_, j) => checkAutoManip(id, price, j));
           }
         });
-        console.log(`Prices: USDCHF=${cachedPrices.usdchf} EURUSD=${cachedPrices.eurusd} USDJPY=${cachedPrices.usdjpy} AUDUSD=${cachedPrices.audusd}`);
+        console.log('Prices OK: USDCHF=' + cachedPrices.usdchf + ' EURUSD=' + cachedPrices.eurusd + ' USDJPY=' + cachedPrices.usdjpy + ' AUDUSD=' + cachedPrices.audusd);
         return cachedPrices;
       }
-    } catch(e) { console.log(`API failed: ${e.message}`); }
+    } catch(e) { console.log('API ' + (idx+1) + ' failed: ' + e.message); }
   }
+  console.log('All price APIs failed - using cached');
   return cachedPrices;
 }
 
