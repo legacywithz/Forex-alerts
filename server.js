@@ -249,8 +249,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding-bot
 <script>
 const PC=[
   {id:'eurusd',name:'EUR/USD',pip:0.0001,jpy:false,trend:'bull',ak:'EURUSD',def:[1.17000,1.17250,1.17500,1.17800]},
-  {id:'usdchf',name:'USD/CHF',pip:0.0001,jpy:false,trend:'bear',ak:'USDCHF',def:[0.78500,0.78750,0.79000,0.78250]},
+  {id:'usdchf',name:'USD/CHF',pip:0.0001,jpy:false,trend:'bear',ak:'USDCHF',def:[0.78500,0.78650,0.79000,0.78280]},
   {id:'usdjpy',name:'USD/JPY',pip:0.01,  jpy:true, trend:'bear',ak:'USDJPY',def:[142.000,142.500,143.000,143.500]},
+  {id:'audusd',name:'AUD/USD',pip:0.0001,jpy:false,trend:'bull',ak:'AUDUSD',def:[0.71000,0.71500,0.72000,0.70500]},
 ];
 const SLP=20,SK='fxv5',UK='fxv5url';
 let SRV=localStorage.getItem(UK)||'__SERVER_URL__',LP={},PP={},LSU=0,SMODE=false;
@@ -314,10 +315,13 @@ async function pushSt(){if(!SRV||!SMODE)return;try{await fetch(SRV+'/state',{met
 
 async function fetchPx(){
   try{
-    const r=await fetch('https://www.freeforexapi.com/api/live?pairs=EURUSD,USDCHF,USDJPY',{signal:AbortSignal.timeout(8000)});
-    const d=await r.json();if(d.code!==200)throw new Error();
-    PP={...LP};Object.entries(d.rates).forEach(([k,v])=>{LP[k.toLowerCase()]=v.rate;});
-    if(SRV&&SMODE){const pb={eurusd:LP['eurusd'],usdchf:LP['usdchf'],usdjpy:LP['usdjpy']};fetch(SRV+'/price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pb),signal:AbortSignal.timeout(3000)}).catch(()=>{});}
+    // Try server-side price endpoint first (most reliable)
+    const baseUrl=SRV&&SMODE?SRV:window.location.origin;
+    const r=await fetch(baseUrl+'/prices',{signal:AbortSignal.timeout(8000)});
+    const d=await r.json();
+    if(!d.ok||!d.prices)throw new Error('No prices');
+    PP={...LP};
+    Object.entries(d.prices).forEach(([k,v])=>{LP[k.toLowerCase()]=v;});
     PC.forEach(cfg=>{
       const pr=LP[cfg.ak.toLowerCase()];if(!pr)return;
       const pv=PP[cfg.ak.toLowerCase()];
@@ -775,6 +779,173 @@ app.post('/price', (req, res) => {
 });
 
 const PAIRS_CFG_IDS = ['eurusd','usdchf','usdjpy'];
+
+// ── Server-side live price fetching ──────────────────────────────────────────
+// Tries multiple free APIs with fallback so prices always populate
+let cachedPrices = {};
+let priceLastFetched = 0;
+
+async function fetchServerPrices() {
+  const now = Date.now();
+  // Cache for 10 seconds to avoid hammering APIs
+  if (now - priceLastFetched < 10000 && Object.keys(cachedPrices).length > 0) {
+    return cachedPrices;
+  }
+
+  // Try multiple APIs in order — first success wins
+  const apis = [
+    // API 1: freeforexapi — works well server side with node-fetch
+    async () => {
+      const https = require('https');
+      return new Promise((resolve, reject) => {
+        const options = {
+          hostname: 'www.freeforexapi.com',
+          path: '/api/live?pairs=EURUSD,USDCHF,USDJPY,AUDUSD',
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; ForexAlertBot/1.0)',
+            'Accept': 'application/json'
+          },
+          timeout: 8000
+        };
+        const req = https.request(options, res => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            try {
+              const json = JSON.parse(data);
+              if (json.code === 200 && json.rates) {
+                const prices = {};
+                Object.entries(json.rates).forEach(([k, v]) => {
+                  prices[k.toLowerCase()] = v.rate;
+                });
+                resolve(prices);
+              } else {
+                reject(new Error('Bad response'));
+              }
+            } catch(e) { reject(e); }
+          });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+        req.end();
+      });
+    },
+
+    // API 2: exchangerate-api open access (no key needed)
+    // Gets USD base rates then calculates pairs
+    async () => {
+      const https = require('https');
+      return new Promise((resolve, reject) => {
+        const options = {
+          hostname: 'open.er-api.com',
+          path: '/v6/latest/USD',
+          method: 'GET',
+          headers: { 'User-Agent': 'ForexAlertBot/1.0' },
+          timeout: 8000
+        };
+        const req = https.request(options, res => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            try {
+              const json = JSON.parse(data);
+              if (json.result === 'success' && json.rates) {
+                const r = json.rates;
+                const prices = {};
+                // Calculate pairs from USD base
+                if (r.CHF) prices['usdchf'] = r.CHF;
+                if (r.JPY) prices['usdjpy'] = r.JPY;
+                if (r.EUR) prices['eurusd'] = 1 / r.EUR;
+                if (r.AUD) prices['audusd'] = 1 / r.AUD;
+                resolve(prices);
+              } else {
+                reject(new Error('Bad response'));
+              }
+            } catch(e) { reject(e); }
+          });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+        req.end();
+      });
+    },
+
+    // API 3: frankfurter.dev — open source, no key, ECB data
+    async () => {
+      const https = require('https');
+      return new Promise((resolve, reject) => {
+        const options = {
+          hostname: 'api.frankfurter.dev',
+          path: '/v2/latest?base=USD&symbols=CHF,JPY,EUR,AUD',
+          method: 'GET',
+          headers: { 'User-Agent': 'ForexAlertBot/1.0' },
+          timeout: 8000
+        };
+        const req = https.request(options, res => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            try {
+              const json = JSON.parse(data);
+              if (json.rates) {
+                const r = json.rates;
+                const prices = {};
+                if (r.CHF) prices['usdchf'] = r.CHF;
+                if (r.JPY) prices['usdjpy'] = r.JPY;
+                if (r.EUR) prices['eurusd'] = 1 / r.EUR;
+                if (r.AUD) prices['audusd'] = 1 / r.AUD;
+                resolve(prices);
+              } else {
+                reject(new Error('Bad response'));
+              }
+            } catch(e) { reject(e); }
+          });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+        req.end();
+      });
+    }
+  ];
+
+  // Try each API in order
+  for (const api of apis) {
+    try {
+      const prices = await api();
+      if (prices && Object.keys(prices).length >= 2) {
+        cachedPrices = prices;
+        priceLastFetched = Date.now();
+        console.log(`Prices fetched: USDCHF=${prices.usdchf} EURUSD=${prices.eurusd} USDJPY=${prices.usdjpy}`);
+        // Run auto-manipulation check with fresh prices
+        PAIRS_CFG_IDS.forEach(pairId => {
+          const price = parseFloat(prices[pairId]);
+          if (isNaN(price) || !STATE[pairId]) return;
+          STATE[pairId].levels.forEach((l, i) => checkAutoManip(pairId, price, i));
+        });
+        return prices;
+      }
+    } catch(e) {
+      console.log(`Price API failed: ${e.message} — trying next...`);
+    }
+  }
+  console.log('All price APIs failed — returning cached prices');
+  return cachedPrices;
+}
+
+// Fetch prices on server startup and every 15 seconds
+fetchServerPrices();
+setInterval(fetchServerPrices, 15000);
+
+// Expose prices to the frontend
+app.get('/prices', async (req, res) => {
+  try {
+    const prices = await fetchServerPrices();
+    res.json({ ok: true, prices, lastUpdated: priceLastFetched });
+  } catch(e) {
+    res.status(500).json({ ok: false, error: e.message, prices: cachedPrices });
+  }
+});
 
 
 // ── Serve the trading tool UI ─────────────────────────────────────────────────
